@@ -7,6 +7,7 @@ import platform
 import shutil
 import subprocess
 import sys
+import tarfile
 import urllib.request
 import zipfile
 from datetime import datetime
@@ -16,7 +17,23 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from core.splatting import runtime
 
 UV_VERSION = "0.12.11"
-UV_SHA256 = "e94225dea91e051472847bd6d146d7d66c4f54ffcd1f106678866a99580845f9"
+# uv ships a flat zip on Windows (uv.exe at the archive root) and a tarball on Linux
+# with the exe nested under a versioned directory (uv-x86_64-unknown-linux-gnu/uv) --
+# fetch_uv() below flattens that so the rest of this file just uses runtime.TOOLS / exe.
+_UV_ASSETS = {
+    ("win32", "amd64"): {
+        "url": f"https://github.com/astral-sh/uv/releases/download/{UV_VERSION}/uv-x86_64-pc-windows-msvc.zip",
+        "sha256": "e94225dea91e051472847bd6d146d7d66c4f54ffcd1f106678866a99580845f9",
+        "archive_name": "uv.zip",
+        "exe": "uv.exe",
+    },
+    ("linux", "x86_64"): {
+        "url": f"https://github.com/astral-sh/uv/releases/download/{UV_VERSION}/uv-x86_64-unknown-linux-gnu.tar.gz",
+        "sha256": "4ae93e0f148a18434cc094072547cec88912fc4a72b984183c7d0d0e9586cb5e",
+        "archive_name": "uv.tar.gz",
+        "exe": "uv",
+    },
+}
 
 def log(message):
     print(f"[SplatKit 4D setup] {message}", flush=True)
@@ -45,12 +62,47 @@ def download(url, target, expected_hash):
 
 def extract(archive, dest):
     dest.mkdir(parents=True, exist_ok=True)
-    with zipfile.ZipFile(archive) as z:
-        for item in z.infolist():
-            target = (dest / item.filename).resolve()
-            if not target.is_relative_to(dest.resolve()):
-                raise RuntimeError(f"Unsafe archive member: {item.filename}")
-        z.extractall(dest)
+    if archive.name.endswith(".zip"):
+        with zipfile.ZipFile(archive) as z:
+            for item in z.infolist():
+                target = (dest / item.filename).resolve()
+                if not target.is_relative_to(dest.resolve()):
+                    raise RuntimeError(f"Unsafe archive member: {item.filename}")
+            z.extractall(dest)
+    else:
+        with tarfile.open(archive) as t:
+            for member in t.getmembers():
+                target = (dest / member.name).resolve()
+                if not target.is_relative_to(dest.resolve()):
+                    raise RuntimeError(f"Unsafe archive member: {member.name}")
+            t.extractall(dest)
+
+def fetch_uv():
+    """Download (if needed) and return the path to the uv executable for this platform.
+
+    Windows ships a flat zip (uv.exe at the archive root); Linux ships a tarball with
+    the exe nested under a versioned directory (uv-x86_64-unknown-linux-gnu/uv) --
+    flatten that here so every other call site just uses runtime.TOOLS / <exe name>.
+    """
+    key = (sys.platform, platform.machine().lower())
+    try:
+        asset = _UV_ASSETS[key]
+    except KeyError:
+        raise RuntimeError(f"No uv release known for {key[0]}/{key[1]}.")
+    exe = runtime.TOOLS / asset["exe"]
+    if exe.is_file():
+        return exe
+    archive = download(asset["url"], runtime.TOOLS / asset["archive_name"], asset["sha256"])
+    extract(archive, runtime.TOOLS)
+    if not exe.is_file():
+        nested = next(runtime.TOOLS.glob(f"*/{asset['exe']}"), None)
+        if nested is None:
+            raise RuntimeError(f"{asset['exe']} not found after extracting {archive.name}")
+        nested.replace(exe)
+        shutil.rmtree(nested.parent, ignore_errors=True)
+    if os.name != "nt":
+        exe.chmod(exe.stat().st_mode | 0o111)
+    return exe
 
 def environment():
     env = os.environ.copy()
@@ -67,14 +119,14 @@ def run(args, cwd=None):
     subprocess.run(list(map(str, args)), env=environment(), cwd=cwd, check=True)
 
 def python():
-    return runtime.VENV / "Scripts" / "python.exe"
+    return runtime.VENV / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
 
 def clean_cache():
     """Drop the uv download/build cache once the install succeeds. It holds ~7 GB and
     nothing in the venv references it -- UV_LINK_MODE=copy copies every package into
     site-packages, so the cache only speeds up the next build. It is re-created on the
     next upgrade. Best-effort: a locked cache file must never fail a good install."""
-    uv = runtime.TOOLS / "uv.exe"
+    uv = runtime.TOOLS / ("uv.exe" if os.name == "nt" else "uv")
     if not uv.is_file():
         return
     try:
@@ -93,7 +145,6 @@ def remove_backend(path):
 
 @contextlib.contextmanager
 def install_lock():
-    import msvcrt
     runtime.ROOT.mkdir(parents=True, exist_ok=True)
     with open(runtime.ROOT / ".splat_backend.lock", "a+b") as lock:
         lock.seek(0)
@@ -101,15 +152,27 @@ def install_lock():
             lock.write(b"0")
             lock.flush()
         lock.seek(0)
-        try:
-            msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
-        except OSError as exc:
-            raise RuntimeError("Another 4D backend setup is already running.") from exc
-        try:
-            yield
-        finally:
-            lock.seek(0)
-            msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
+        if os.name == "nt":
+            import msvcrt
+            try:
+                msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+            except OSError as exc:
+                raise RuntimeError("Another 4D backend setup is already running.") from exc
+            try:
+                yield
+            finally:
+                lock.seek(0)
+                msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+            try:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError as exc:
+                raise RuntimeError("Another 4D backend setup is already running.") from exc
+            try:
+                yield
+            finally:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
 SMOKE = r"""
 import json
@@ -252,10 +315,7 @@ def install(rebuild=False, keep_cache=False):
     if shutil.disk_usage(runtime.ROOT).free < 20 * 10**9:
         raise RuntimeError("Setup needs at least 20 GB free on the backend drive.")
     wheel = download(runtime.WHEEL_URL, runtime.TOOLS / runtime.WHEEL_NAME, runtime.WHEEL_SHA256)
-    uv = runtime.TOOLS / "uv.exe"
-    archive = download(f"https://github.com/astral-sh/uv/releases/download/{UV_VERSION}/uv-x86_64-pc-windows-msvc.zip",
-                       runtime.TOOLS / "uv.zip", UV_SHA256)
-    extract(archive, runtime.TOOLS)
+    uv = fetch_uv()
     if runtime.BACKEND.exists():
         if runtime.MANIFEST.is_file():
             runtime.BACKEND.rename(previous)
@@ -284,8 +344,16 @@ def install(rebuild=False, keep_cache=False):
     log("Ready. Models download when you run generation or training.")
 
 def main():
-    if sys.platform != "win32" or platform.machine().lower() not in {"amd64", "x86_64"}:
-        raise RuntimeError("This release provides a Windows x64 CUDA backend only. No compatible prebuilt wheel is bundled for this platform.")
+    if runtime.wheel_info() is None:
+        raise RuntimeError(
+            "No gsplat backend wheel is available for this platform "
+            f"({sys.platform}/{platform.machine()}). Supported: Windows x64, Linux x86_64."
+        )
+    if not runtime.WHEEL_SHA256:
+        raise RuntimeError(
+            f"{runtime.WHEEL_NAME} has no pinned SHA-256 yet for this platform -- "
+            "see docs/LINUX_BACKEND.md."
+        )
     args = sys.argv[1:]
     with install_lock():
         install("--rebuild" in args, keep_cache="--keep-cache" in args)
