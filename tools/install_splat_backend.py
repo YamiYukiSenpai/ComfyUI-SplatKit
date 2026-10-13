@@ -204,6 +204,14 @@ assert torch.isfinite(rgb).all() and alpha.max() > 0
 assert colors.grad is not None and torch.isfinite(colors.grad).all()
 assert means.grad is not None and torch.isfinite(means.grad).all()
 print('CUDA rasterization and backward passed on ' + torch.cuda.get_device_name())
+from core.splatting import runtime
+if runtime.sage_wheel_info():
+    from sageattention import sageattn
+    q, k, v = (torch.randn(1, 8, 256, 64, device='cuda', dtype=torch.float16) for _ in range(3))
+    out = sageattn(q, k, v)
+    torch.cuda.synchronize()
+    assert out.shape == q.shape and torch.isfinite(out).all()
+    print('SageAttention passed on ' + torch.cuda.get_device_name())
 """
 
 def verify():
@@ -256,6 +264,20 @@ def refresh_sources(contract, generator_id, retire_legacy=False):
     remove_source(previous)
 
 
+def install_sage(uv):
+    """Install the SageAttention wheel into the backend venv; nothing on a platform without one."""
+    if not runtime.SAGE_WHEEL_URL:
+        return
+    sage = download(runtime.SAGE_WHEEL_URL, runtime.TOOLS / runtime.SAGE_WHEEL_NAME, runtime.SAGE_WHEEL_SHA256)
+    run([uv, "pip", "install", "--python", python(), "--no-deps", "--reinstall-package", "sageattention", sage])
+
+
+def only_sage_changed(old, new):
+    """True when the installed contract differs from the expected one only by SageAttention."""
+    key = "sageattention_sha256"
+    return {k: v for k, v in old.items() if k != key} == {k: v for k, v in new.items() if k != key}
+
+
 def can_migrate(facts, contract):
     """The old package-based environment can be reused if its actual dependencies match."""
     old = facts.get("contract", {})
@@ -302,8 +324,14 @@ def install(rebuild=False, keep_cache=False):
     if runtime.MANIFEST.is_file() and python().is_file() and not rebuild:
         facts = json.loads(runtime.MANIFEST.read_text(encoding="utf-8"))
         current = facts.get("contract") == contract and facts.get("cuda_smoke_test")
+        # Adding or replacing SageAttention needs no new environment: install the wheel into
+        # this one, then let refresh_sources verify it and record the new contract.
+        sage_updated = False
+        if not current and facts.get("cuda_smoke_test") and only_sage_changed(facts.get("contract", {}), contract):
+            install_sage(fetch_uv())
+            current = sage_updated = True
         interrupted = runtime.CHECKOUT.with_name("4DAnyone.previous").exists()
-        if current and facts.get("generator_source_id") == generator_id and (runtime.CHECKOUT / "inference.py").is_file() and not interrupted:
+        if current and not sage_updated and facts.get("generator_source_id") == generator_id and (runtime.CHECKOUT / "inference.py").is_file() and not interrupted:
             log("Backend already up to date.")
             return
         if current or can_migrate(facts, contract):
@@ -327,6 +355,7 @@ def install(rebuild=False, keep_cache=False):
         base = [uv, "pip", "install", "--python", python(), "--constraint", runtime.REQUIREMENTS]
         run(base + ["--torch-backend", "cu128", "torch==" + runtime.TORCH, "torchvision==" + runtime.TORCHVISION])
         run(base + [wheel])
+        install_sage(uv)
         shutil.copytree(runtime.GENERATOR_SOURCE, runtime.CHECKOUT,
                         ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
         run(base + ["--torch-backend", "cu128", "-r", runtime.CHECKOUT / "requirements.txt",

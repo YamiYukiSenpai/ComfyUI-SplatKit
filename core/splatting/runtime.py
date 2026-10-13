@@ -63,6 +63,37 @@ WHEEL_NAME = _active_wheel.get("name")
 WHEEL_SHA256 = _active_wheel.get("sha256", "")
 WHEEL_URL = _active_wheel.get("url")
 
+# SageAttention 2.2.0 for the 4DAnyone generator (attention=sage). Optional: a platform
+# without an entry keeps sdpa. ComfyUI's own sageattention cannot be reused here -- it is
+# compiled for ComfyUI's torch (2.9.1+cu130), this venv runs torch 2.8.0+cu128. Linux:
+# built from thu-ml/SageAttention v2.2.0 (eb615cf) with CUDA 12.8 for sm_86
+# (RTX 3090 / A5000) and sm_120 (RTX PRO 6000 Blackwell). The wheel is attached to the
+# PR that introduces this entry; sha256 below is already correct regardless of where it
+# ends up hosted. Until the url is filled in, the entry is ignored and Linux keeps sdpa.
+# TODO(maintainer): pick a permanent home for the Linux wheel (a GitHub Release asset,
+# matching the gsplat entries, is the obvious default) and fill in the URL below.
+_SAGE_WHEELS = {
+    ("linux", "x86_64"): {
+        "name": "sageattention-2.2.0+pt28cu128-cp311-cp311-linux_x86_64.whl",
+        "sha256": "66d043268455942f707e5d1adc368e95f41cd9264c004d26632f495877399b99",
+        # TODO(maintainer): fill in once the wheel (attached to this PR) has a
+        # permanent home.
+        "url": "",
+    },
+}
+
+
+def sage_wheel_info():
+    """The SageAttention backend wheel for the current platform, or None if there is none."""
+    info = _SAGE_WHEELS.get((sys.platform, platform.machine().lower()))
+    return info if info and info["url"] else None
+
+
+_active_sage = sage_wheel_info() or {}
+SAGE_WHEEL_NAME = _active_sage.get("name")
+SAGE_WHEEL_SHA256 = _active_sage.get("sha256", "")
+SAGE_WHEEL_URL = _active_sage.get("url")
+
 
 def source_id(source):
     digest = hashlib.sha256()
@@ -94,6 +125,7 @@ def expected():
     return {"schema": 2, "python": PYTHON, "abi": "cp311", "platform": sys.platform,
             "machine": platform.machine().lower(), "torch": TORCH, "torchvision": TORCHVISION,
             "cuda": CUDA, "gsplat": GSPLAT, "wheel_sha256": WHEEL_SHA256,
+            "sageattention_sha256": SAGE_WHEEL_SHA256,
             "requirements": requirements(REQUIREMENTS),
             "generator_requirements": requirements(GENERATOR_SOURCE / "requirements.txt")}
 
